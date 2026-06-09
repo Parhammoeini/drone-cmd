@@ -1,22 +1,27 @@
+# main.py
 import json
 import time
 import logging
-import signal
 
 from drone import DroneController
 from llm import plan_next_commands
-from safety import SafetyWatchdog
+from metrics import Metrics  # <-- Imported your standalone metrics module
 
+# ── Logging Configuration (Redirected to keep console clear) ────────────────
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler("drone.log", mode="w", encoding="utf-8"),
+        logging.StreamHandler()  # Keeps terminal inputs clean from overlapping loops
+    ]
 )
 log = logging.getLogger(__name__)
+logging.getLogger("djitellopy").setLevel(logging.WARNING)
 
 
 # ── Command executor ─────────────────────────────────────────────────────────
 
-# Seconds to wait after each move/rotate so drone physically completes it
 MOVE_SETTLE_TIME = 2.0
 
 def execute_command(drone: DroneController, cmd: dict) -> bool:
@@ -40,51 +45,19 @@ def execute_command(drone: DroneController, cmd: dict) -> bool:
     return True
 
 
-# ── Latency printer ──────────────────────────────────────────────────────────
-
-def print_latency(cycle: int, lat: dict):
-    print(f"\n{'─'*50}")
-    print(f"  📊 Cycle {cycle} Latency")
-    print(f"{'─'*50}")
-    print(f"  LLM inference  : {lat['llm_ms']:>8.1f} ms")
-    print(f"  JSON parse     : {lat['parse_ms']:>8.2f} ms")
-    print(f"  Total          : {lat['total_ms']:>8.1f} ms")
-    if lat.get("prompt_tokens"):
-        print(f"  Prompt tokens  : {lat['prompt_tokens']}")
-        print(f"  Completion tok : {lat['completion_tokens']}")
-        print(f"  Tokens/sec     : {lat['tokens_per_sec']}")
-    print(f"{'─'*50}\n")
-
-
-def print_summary(latencies: list):
-    if not latencies:
-        return
-    llm_times   = [l["llm_ms"]   for l in latencies]
-    total_times = [l["total_ms"] for l in latencies]
-    print(f"\n{'═'*50}")
-    print(f"  📈 Session Summary ({len(latencies)} LLM calls)")
-    print(f"{'═'*50}")
-    print(f"  LLM avg  : {sum(llm_times)/len(llm_times):>8.1f} ms")
-    print(f"  LLM min  : {min(llm_times):>8.1f} ms")
-    print(f"  LLM max  : {max(llm_times):>8.1f} ms")
-    print(f"  Total avg: {sum(total_times)/len(total_times):>8.1f} ms")
-    print(f"{'═'*50}\n")
-
-
 # ── Interactive command loop ──────────────────────────────────────────────────
 
 def interactive_loop(drone: DroneController):
-    history       = []
-    all_latencies = []
-    cycle         = 0
+    history = []
+    cycle = 0
+    
+    # Initialize the metrics manager from metrics.py
+    metrics_tracker = Metrics()
 
     print("─" * 50)
     print("  Type commands in plain English. Examples:")
     print("    move forward 1 meter")
     print("    go left 50cm")
-    print("    make a 1 meter square")
-    print("    flip forward")
-    print("    rotate 180 degrees")
     print("    land  (or 'quit')")
     print("  type 'stop' = emergency cut motors")
     print("─" * 50 + "\n")
@@ -112,34 +85,48 @@ def interactive_loop(drone: DroneController):
 
         cycle += 1
 
-        # Wrap the entire command-processing block so that a spurious
-        # KeyboardInterrupt from a djitellopy background thread doesn't
-        # silently trigger a landing. User must type "land"/"stop" to exit.
         try:
             telemetry = drone.get_telemetry()
-            log.info(f"🔋 Battery: {telemetry['battery']}%  Height: {telemetry['height']} cm")
-
-            commands, latency = plan_next_commands(user_input, telemetry, history)
-            latency["cycle"] = cycle
-            all_latencies.append(latency)
-            print_latency(cycle, latency)
-
+            
+            # --- Profile LLM Inference ---
+            t0 = time.perf_counter()
+            commands, _ = plan_next_commands(user_input, telemetry, history)
+            t1 = time.perf_counter()
+            
             history.append({"role": "user",      "content": user_input})
             history.append({"role": "assistant", "content": json.dumps({"commands": commands})})
 
+            # --- Profile Drone Physical Movements ---
+            t2 = time.perf_counter()
+            execution_success = True
             for cmd in commands:
-                execute_command(drone, cmd)
+                try:
+                    execute_command(drone, cmd)
+                except Exception as exec_err:
+                    log.error(f"Command execution failed: {exec_err}")
+                    execution_success = False
+            t3 = time.perf_counter()
+
+            # Record session log entries
+            metrics_tracker.record(
+                goal=user_input,
+                commands=commands,
+                llm_time=(t1 - t0),
+                exec_time=(t3 - t2),
+                success=execution_success
+            )
 
             time.sleep(0.3)
 
         except KeyboardInterrupt:
-            # Background-thread signal fired during SDK/LLM work — ignore, don't land.
             print()
             print("  ⚠️  Interrupted mid-command (background signal). Drone still flying.")
             print("  (type 'land' to land, 'stop' for emergency cutoff)")
             continue
 
-    print_summary(all_latencies)
+    # Clean display and file dumps upon landing complete
+    metrics_tracker.summary()
+    metrics_tracker.save()
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -157,7 +144,6 @@ if __name__ == "__main__":
         interactive_loop(drone)
 
     except KeyboardInterrupt:
-        # Ctrl+C during takeoff only — the loop handles its own.
         print("\n🛬 Ctrl+C during startup — landing.")
         try:
             drone.land()
